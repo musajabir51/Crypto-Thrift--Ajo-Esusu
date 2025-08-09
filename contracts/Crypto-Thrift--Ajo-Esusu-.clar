@@ -6,6 +6,9 @@
 (define-constant err-not-active-cycle (err u104))
 (define-constant err-cycle-in-progress (err u105))
 (define-constant err-invalid-position (err u106))
+(define-constant err-emergency-not-approved (err u107))
+(define-constant err-no-emergency-request (err u108))
+(define-constant err-already-requested (err u109))
 
 (define-data-var cycle-id uint u0)
 (define-data-var current-position uint u0)
@@ -21,6 +24,7 @@
         total-contributed: uint,
         total-received: uint,
         join-height: uint,
+        emergency-requested: bool,
     }
 )
 
@@ -32,6 +36,16 @@
         total-amount: uint,
         members-count: uint,
         completed: bool,
+    }
+)
+
+(define-map emergency-requests
+    principal
+    {
+        request-height: uint,
+        reason: (string-ascii 100),
+        approved: bool,
+        processed: bool,
     }
 )
 
@@ -60,6 +74,7 @@
             total-contributed: u0,
             total-received: u0,
             join-height: u0,
+            emergency-requested: false,
         }))
     )
 )
@@ -149,4 +164,69 @@
 
 (define-read-only (get-current-cycle)
     (var-get cycle-id)
+)
+
+(define-public (request-emergency-withdrawal (reason (string-ascii 100)))
+    (let ((member (unwrap! (map-get? members tx-sender) err-not-member)))
+        (asserts! (not (get emergency-requested member)) err-already-requested)
+        (asserts! (is-none (map-get? emergency-requests tx-sender))
+            err-already-requested
+        )
+        (map-set members tx-sender (merge member { emergency-requested: true }))
+        (map-set emergency-requests tx-sender {
+            request-height: burn-block-height,
+            reason: reason,
+            approved: false,
+            processed: false,
+        })
+        (ok true)
+    )
+)
+
+(define-public (approve-emergency-withdrawal (member-address principal))
+    (let ((request (unwrap! (map-get? emergency-requests member-address)
+            err-no-emergency-request
+        )))
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (not (get processed request)) err-no-emergency-request)
+        (map-set emergency-requests member-address
+            (merge request { approved: true })
+        )
+        (ok true)
+    )
+)
+
+(define-public (execute-emergency-withdrawal)
+    (let (
+            (request (unwrap! (map-get? emergency-requests tx-sender)
+                err-no-emergency-request
+            ))
+            (member (unwrap! (map-get? members tx-sender) err-not-member))
+            (cycle (unwrap! (map-get? cycles (var-get cycle-id)) err-not-active-cycle))
+            (penalty-rate u10)
+            (contributed (get total-contributed member))
+            (penalty (/ (* contributed penalty-rate) u100))
+            (withdrawal-amount (- contributed penalty))
+        )
+        (asserts! (get approved request) err-emergency-not-approved)
+        (asserts! (not (get processed request)) err-no-emergency-request)
+        (asserts! (> contributed u0) err-insufficient-funds)
+        (try! (as-contract (stx-transfer? withdrawal-amount tx-sender tx-sender)))
+        (map-set emergency-requests tx-sender (merge request { processed: true }))
+        (map-delete members tx-sender)
+        (ok withdrawal-amount)
+    )
+)
+
+(define-private (calculate-emergency-withdrawal-amount
+        (contributed uint)
+        (penalty-rate uint)
+    )
+    (let ((penalty (/ (* contributed penalty-rate) u100)))
+        (- contributed penalty)
+    )
+)
+
+(define-read-only (get-emergency-request (member principal))
+    (map-get? emergency-requests member)
 )
