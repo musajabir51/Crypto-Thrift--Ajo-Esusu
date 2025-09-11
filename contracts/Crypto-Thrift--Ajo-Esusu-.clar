@@ -9,12 +9,14 @@
 (define-constant err-emergency-not-approved (err u107))
 (define-constant err-no-emergency-request (err u108))
 (define-constant err-already-requested (err u109))
+(define-constant err-member-not-found (err u110))
 
 (define-data-var cycle-id uint u0)
 (define-data-var current-position uint u0)
 (define-data-var contribution-amount uint u0)
 (define-data-var cycle-active bool false)
 (define-data-var total-members uint u0)
+(define-data-var members-registry (list 100 principal) (list))
 
 (define-map members
     principal
@@ -25,6 +27,11 @@
         total-received: uint,
         join-height: uint,
         emergency-requested: bool,
+        on-time-payments: uint,
+        late-payments: uint,
+        missed-payments: uint,
+        reputation-score: uint,
+        cycles-participated: uint,
     }
 )
 
@@ -49,6 +56,18 @@
     }
 )
 
+(define-map member-performance
+    {
+        member: principal,
+        cycle: uint,
+    }
+    {
+        payment-height: uint,
+        payment-status: (string-ascii 20),
+        days-late: uint,
+    }
+)
+
 (define-public (initialize-thrift
         (amount uint)
         (member-count uint)
@@ -68,13 +87,23 @@
         (asserts! (not (var-get cycle-active)) err-cycle-in-progress)
         (asserts! (<= position (var-get total-members)) err-invalid-position)
         (asserts! (is-none (map-get? members tx-sender)) err-already-member)
+        (var-set members-registry
+            (unwrap!
+                (as-max-len? (append (var-get members-registry) tx-sender) u100)
+                err-invalid-position
+            ))
         (ok (map-set members tx-sender {
             position: position,
             paid-current-cycle: false,
             total-contributed: u0,
             total-received: u0,
-            join-height: u0,
+            join-height: burn-block-height,
             emergency-requested: false,
+            on-time-payments: u0,
+            late-payments: u0,
+            missed-payments: u0,
+            reputation-score: u100,
+            cycles-participated: u0,
         }))
     )
 )
@@ -101,17 +130,52 @@
     (let (
             (cycle (unwrap! (map-get? cycles (var-get cycle-id)) err-not-active-cycle))
             (member (unwrap! (map-get? members tx-sender) err-not-member))
+            (current-height burn-block-height)
+            (cycle-start (get start-height cycle))
+            (grace-period u20)
+            (days-late (if (> current-height (+ cycle-start grace-period))
+                (- current-height (+ cycle-start grace-period))
+                u0
+            ))
+            (payment-status (if (is-eq days-late u0)
+                "on-time"
+                "late"
+            ))
         )
         (asserts! (var-get cycle-active) err-not-active-cycle)
         (asserts! (not (get paid-current-cycle member)) err-already-member)
         (try! (stx-transfer? (var-get contribution-amount) tx-sender
             (as-contract tx-sender)
         ))
-        (map-set members tx-sender
-            (merge member {
-                paid-current-cycle: true,
-                total-contributed: (+ (get total-contributed member) (var-get contribution-amount)),
-            })
+        (map-set member-performance {
+            member: tx-sender,
+            cycle: (var-get cycle-id),
+        } {
+            payment-height: current-height,
+            payment-status: payment-status,
+            days-late: days-late,
+        })
+        (let ((updated-member (if (is-eq payment-status "on-time")
+                (merge member {
+                    paid-current-cycle: true,
+                    total-contributed: (+ (get total-contributed member)
+                        (var-get contribution-amount)
+                    ),
+                    on-time-payments: (+ (get on-time-payments member) u1),
+                    cycles-participated: (+ (get cycles-participated member) u1),
+                })
+                (merge member {
+                    paid-current-cycle: true,
+                    total-contributed: (+ (get total-contributed member)
+                        (var-get contribution-amount)
+                    ),
+                    late-payments: (+ (get late-payments member) u1),
+                    cycles-participated: (+ (get cycles-participated member) u1),
+                })
+            )))
+            (map-set members tx-sender
+                (merge updated-member { reputation-score: (calculate-reputation-score updated-member) })
+            )
         )
         (map-set cycles (var-get cycle-id)
             (merge cycle { total-amount: (+ (get total-amount cycle) (var-get contribution-amount)) })
@@ -151,7 +215,64 @@
 )
 
 (define-private (find-recipient-by-position (pos uint))
-    (some tx-sender)
+    (let ((member-list (var-get members-registry)))
+        (fold check-member-position member-list none)
+    )
+)
+
+(define-private (check-member-position
+        (member principal)
+        (current-match (optional principal))
+    )
+    (if (is-some current-match)
+        current-match
+        (let ((member-data (map-get? members member)))
+            (match member-data
+                member-info (if (is-eq (get position member-info) (var-get current-position))
+                    (some member)
+                    none
+                )
+                none
+            )
+        )
+    )
+)
+
+(define-private (calculate-reputation-score (member-data {
+    position: uint,
+    paid-current-cycle: bool,
+    total-contributed: uint,
+    total-received: uint,
+    join-height: uint,
+    emergency-requested: bool,
+    on-time-payments: uint,
+    late-payments: uint,
+    missed-payments: uint,
+    reputation-score: uint,
+    cycles-participated: uint,
+}))
+    (let (
+            (total-payments (+ (get on-time-payments member-data) (get late-payments member-data)))
+            (on-time-rate (if (> total-payments u0)
+                (/ (* (get on-time-payments member-data) u100) total-payments)
+                u100
+            ))
+            (participation-bonus (if (> (get cycles-participated member-data) u5)
+                u10
+                u0
+            ))
+            (penalty (if (> (get missed-payments member-data) u0)
+                (* (get missed-payments member-data) u5)
+                u0
+            ))
+        )
+        (let ((base-score (+ on-time-rate participation-bonus)))
+            (if (> base-score penalty)
+                (- base-score penalty)
+                u0
+            )
+        )
+    )
 )
 
 (define-read-only (get-member-info (member principal))
@@ -229,4 +350,51 @@
 
 (define-read-only (get-emergency-request (member principal))
     (map-get? emergency-requests member)
+)
+
+(define-read-only (get-member-reputation (member principal))
+    (match (map-get? members member)
+        member-data (ok {
+            reputation-score: (get reputation-score member-data),
+            on-time-payments: (get on-time-payments member-data),
+            late-payments: (get late-payments member-data),
+            missed-payments: (get missed-payments member-data),
+            cycles-participated: (get cycles-participated member-data),
+            payment-rate: (let ((total (+ (get on-time-payments member-data)
+                    (get late-payments member-data)
+                )))
+                (if (> total u0)
+                    (/ (* (get on-time-payments member-data) u100) total)
+                    u0
+                )
+            ),
+        })
+        (err err-not-member)
+    )
+)
+
+(define-read-only (get-member-performance
+        (member principal)
+        (cycle uint)
+    )
+    (map-get? member-performance {
+        member: member,
+        cycle: cycle,
+    })
+)
+
+(define-read-only (get-top-performers (count uint))
+    (let ((member-list (var-get members-registry)))
+        (ok (map get-member-score member-list))
+    )
+)
+
+(define-private (get-member-score (member principal))
+    {
+        member: member,
+        score: (match (map-get? members member)
+            member-data (get reputation-score member-data)
+            u0
+        ),
+    }
 )
