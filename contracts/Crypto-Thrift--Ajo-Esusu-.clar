@@ -10,6 +10,14 @@
 (define-constant err-no-emergency-request (err u108))
 (define-constant err-already-requested (err u109))
 (define-constant err-member-not-found (err u110))
+(define-constant err-loan-not-found (err u111))
+(define-constant err-insufficient-reputation (err u112))
+(define-constant err-loan-already-active (err u113))
+(define-constant err-repayment-too-early (err u114))
+(define-constant err-invalid-repayment-amount (err u115))
+(define-constant err-loan-already-repaid (err u116))
+(define-constant err-max-loans-reached (err u117))
+(define-constant err-insufficient-collateral (err u118))
 
 (define-data-var cycle-id uint u0)
 (define-data-var current-position uint u0)
@@ -17,6 +25,12 @@
 (define-data-var cycle-active bool false)
 (define-data-var total-members uint u0)
 (define-data-var members-registry (list 100 principal) (list))
+
+;; Loan system variables
+(define-data-var next-loan-id uint u1)
+(define-data-var loan-interest-rate uint u5) ;; 5% per cycle
+(define-data-var min-reputation-for-loan uint u70)
+(define-data-var max-loans-per-member uint u3)
 
 (define-map members
     principal
@@ -65,6 +79,45 @@
         payment-height: uint,
         payment-status: (string-ascii 20),
         days-late: uint,
+    }
+)
+
+;; Loan system maps
+(define-map loans
+    uint
+    {
+        borrower: principal,
+        amount: uint,
+        interest-amount: uint,
+        total-repayment: uint,
+        amount-repaid: uint,
+        request-height: uint,
+        due-height: uint,
+        status: (string-ascii 20), ;; "active", "repaid", "defaulted"
+        collateral-amount: uint,
+        reputation-at-request: uint,
+    }
+)
+
+(define-map member-loans
+    principal
+    {
+        active-loans: (list 10 uint),
+        total-loans-taken: uint,
+        total-repaid: uint,
+        defaults: uint,
+    }
+)
+
+(define-map loan-repayments
+    {
+        loan-id: uint,
+        repayment-number: uint,
+    }
+    {
+        amount: uint,
+        repayment-height: uint,
+        remaining-balance: uint,
     }
 )
 
@@ -348,6 +401,148 @@
     )
 )
 
+;; ====================== LOAN SYSTEM FUNCTIONS ======================
+
+(define-public (request-loan (amount uint))
+    (let (
+            (member (unwrap! (map-get? members tx-sender) err-not-member))
+            (reputation (get reputation-score member))
+            (member-loan-data (default-to 
+                { active-loans: (list), total-loans-taken: u0, total-repaid: u0, defaults: u0 }
+                (map-get? member-loans tx-sender)
+            ))
+            (loan-id (var-get next-loan-id))
+            (interest-amount (calculate-loan-interest amount))
+            (total-repayment (+ amount interest-amount))
+            (collateral-required (/ (* amount u20) u100)) ;; 20% collateral
+            (available-collateral (get total-contributed member))
+        )
+        (asserts! (>= reputation (var-get min-reputation-for-loan)) err-insufficient-reputation)
+        (asserts! (> amount u0) err-insufficient-funds)
+        (asserts! (>= available-collateral collateral-required) err-insufficient-collateral)
+        (asserts! (< (len (get active-loans member-loan-data)) (var-get max-loans-per-member)) err-max-loans-reached)
+        
+        ;; Check if member has any active loans
+        (asserts! (is-eq (len (get active-loans member-loan-data)) u0) err-loan-already-active)
+        
+        ;; Create loan record
+        (map-set loans loan-id {
+            borrower: tx-sender,
+            amount: amount,
+            interest-amount: interest-amount,
+            total-repayment: total-repayment,
+            amount-repaid: u0,
+            request-height: burn-block-height,
+            due-height: (+ burn-block-height u1008), ;; Due in 1 week (1008 blocks)
+            status: "active",
+            collateral-amount: collateral-required,
+            reputation-at-request: reputation,
+        })
+        
+        ;; Update member loan tracking
+        (map-set member-loans tx-sender (merge member-loan-data {
+            active-loans: (unwrap! (as-max-len? (append (get active-loans member-loan-data) loan-id) u10) err-max-loans-reached),
+            total-loans-taken: (+ (get total-loans-taken member-loan-data) u1),
+        }))
+        
+        ;; Transfer funds to borrower
+        (try! (as-contract (stx-transfer? amount tx-sender tx-sender)))
+        
+        ;; Increment loan ID
+        (var-set next-loan-id (+ loan-id u1))
+        (ok loan-id)
+    )
+)
+
+(define-public (make-repayment (loan-id uint) (amount uint))
+    (let (
+            (loan (unwrap! (map-get? loans loan-id) err-loan-not-found))
+            (member-loan-data (unwrap! (map-get? member-loans tx-sender) err-not-member))
+        )
+        (asserts! (is-eq tx-sender (get borrower loan)) err-not-member)
+        (asserts! (is-eq (get status loan) "active") err-loan-already-repaid)
+        (asserts! (> amount u0) err-invalid-repayment-amount)
+        
+        (let (
+                (remaining-debt (- (get total-repayment loan) (get amount-repaid loan)))
+                (repayment-amount (if (> amount remaining-debt) remaining-debt amount))
+                (new-amount-repaid (+ (get amount-repaid loan) repayment-amount))
+                (loan-fully-repaid (>= new-amount-repaid (get total-repayment loan)))
+                (repayment-number (+ (/ (get amount-repaid loan) (/ (get total-repayment loan) u10)) u1))
+            )
+            
+            ;; Transfer repayment to contract
+            (try! (stx-transfer? repayment-amount tx-sender (as-contract tx-sender)))
+            
+            ;; Record repayment
+            (map-set loan-repayments {
+                loan-id: loan-id,
+                repayment-number: repayment-number,
+            } {
+                amount: repayment-amount,
+                repayment-height: burn-block-height,
+                remaining-balance: (- (get total-repayment loan) new-amount-repaid),
+            })
+            
+            ;; Update loan status
+            (map-set loans loan-id (merge loan {
+                amount-repaid: new-amount-repaid,
+                status: (if loan-fully-repaid "repaid" "active"),
+            }))
+            
+            ;; If loan is fully repaid, clear active loans list (simplified approach)
+            (if loan-fully-repaid
+                (map-set member-loans tx-sender (merge member-loan-data {
+                    active-loans: (list),
+                    total-repaid: (+ (get total-repaid member-loan-data) u1),
+                }))
+                true
+            )
+            
+            (ok repayment-amount)
+        )
+    )
+)
+
+(define-public (handle-loan-default (loan-id uint))
+    (let (
+            (loan (unwrap! (map-get? loans loan-id) err-loan-not-found))
+            (member-loan-data (unwrap! (map-get? member-loans (get borrower loan)) err-not-member))
+        )
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (is-eq (get status loan) "active") err-loan-already-repaid)
+        (asserts! (> burn-block-height (get due-height loan)) err-repayment-too-early)
+        
+        ;; Mark loan as defaulted
+        (map-set loans loan-id (merge loan { status: "defaulted" }))
+        
+        ;; Update member loan tracking (clear active loans for simplicity)
+        (map-set member-loans (get borrower loan) (merge member-loan-data {
+            active-loans: (list),
+            defaults: (+ (get defaults member-loan-data) u1),
+        }))
+        
+        ;; Apply reputation penalty to defaulting member
+        (let ((member-data (unwrap! (map-get? members (get borrower loan)) err-not-member)))
+            (map-set members (get borrower loan)
+                (merge member-data {
+                    reputation-score: (if (> (get reputation-score member-data) u20)
+                        (- (get reputation-score member-data) u20)
+                        u0
+                    ),
+                })
+            )
+        )
+        
+        (ok true)
+    )
+)
+
+(define-private (calculate-loan-interest (principal-amount uint))
+    (/ (* principal-amount (var-get loan-interest-rate)) u100)
+)
+
+
 (define-read-only (get-emergency-request (member principal))
     (map-get? emergency-requests member)
 )
@@ -397,4 +592,74 @@
             u0
         ),
     }
+)
+
+;; ====================== LOAN SYSTEM READ-ONLY FUNCTIONS ======================
+
+(define-read-only (get-loan-details (loan-id uint))
+    (map-get? loans loan-id)
+)
+
+(define-read-only (get-member-loan-summary (member principal))
+    (map-get? member-loans member)
+)
+
+(define-read-only (get-loan-repayment (loan-id uint) (repayment-number uint))
+    (map-get? loan-repayments {
+        loan-id: loan-id,
+        repayment-number: repayment-number,
+    })
+)
+
+(define-read-only (calculate-loan-eligibility (member principal))
+    (match (map-get? members member)
+        member-data (let (
+                (reputation (get reputation-score member-data))
+                (available-collateral (get total-contributed member-data))
+                (member-loans-data (default-to 
+                    { active-loans: (list), total-loans-taken: u0, total-repaid: u0, defaults: u0 }
+                    (map-get? member-loans member)
+                ))
+                (active-loan-count (len (get active-loans member-loans-data)))
+            )
+            (ok {
+                eligible: (and 
+                    (>= reputation (var-get min-reputation-for-loan))
+                    (< active-loan-count (var-get max-loans-per-member))
+                    (> available-collateral u0)
+                ),
+                reputation-score: reputation,
+                min-reputation-required: (var-get min-reputation-for-loan),
+                active-loans: active-loan-count,
+                max-loans-allowed: (var-get max-loans-per-member),
+                available-collateral: available-collateral,
+                max-loan-amount: (/ (* available-collateral u100) u20), ;; 5x collateral as max loan
+            })
+        )
+        (err err-not-member)
+    )
+)
+
+(define-read-only (get-loan-system-stats)
+    (ok {
+        total-loans-issued: (- (var-get next-loan-id) u1),
+        current-interest-rate: (var-get loan-interest-rate),
+        min-reputation-for-loan: (var-get min-reputation-for-loan),
+        max-loans-per-member: (var-get max-loans-per-member),
+    })
+)
+
+(define-read-only (check-loan-status (loan-id uint))
+    (match (map-get? loans loan-id)
+        loan (ok {
+            status: (get status loan),
+            amount-remaining: (- (get total-repayment loan) (get amount-repaid loan)),
+            days-until-due: (if (> (get due-height loan) burn-block-height)
+                (- (get due-height loan) burn-block-height)
+                u0
+            ),
+            is-overdue: (> burn-block-height (get due-height loan)),
+        })
+        (err err-loan-not-found)
+    )
 )
